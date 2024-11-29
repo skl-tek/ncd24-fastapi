@@ -1,133 +1,72 @@
-name: 1. Non-production deployment
-
-env:
-  # Environment name for main/master branch eg. dev or uat
-  MAIN_BRANCH_ENV_NAME: dev
-  IMAGE_REGISTRY: ghcr.io
-  IMAGE_REPO: ${{ github.actor }}/ncd24-fastapi
-  IMAGE_NAME: ghcr.io/${{ github.actor }}/ncd24-fastapi
-  GITOPS_REPO: ${{ github.actor }}/ncd24-gitops
-  HELM_VALUES_FOLDER: helm-values
-  HELM_VALUES_FILE_PREFIX: ncd24-fastapi
-
-on:
-  push:
-    paths-ignore:
-      - 'README.md'
-      - 'docker-compose.yml'
-      - '.gitignore'
-      - 'requirements-orig-*.txt'
-      - '.devcontainer/**'
-      - 'iac/**'
-    branches:
-      - 'main'
-
-jobs:
-  setup:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Set DEPLOY_ENV
-        run: |
-          if [[ ${{ github.ref_name }} == 'main' || ${{ github.ref_name }} == 'master' ]]; then
-            # You can change this to uat for main/master branch in case of you have more than dev and production environment
-            echo "DEPLOY_ENV=${{ env.MAIN_BRANCH_ENV_NAME }}" >> "$GITHUB_ENV"
-          else
-            echo "DEPLOY_ENV=${{ github.ref_name }}" >> "$GITHUB_ENV"
-          fi
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          # list of Docker images to use as base name for tags
-          images: ${{ env.IMAGE_NAME }}
-          # generate Docker tags based on the following events/attributes
-          tags: |
-            # branch event
-            type=ref,event=branch
-            # tag edge on default branch
-            type=edge
-            # dynamically set the branch name as a prefix
-            type=sha,prefix=${{ env.DEPLOY_ENV }}-,priority=750
-    # For use in other jobs
-    # Need to put a lot of variables here because reusable workflow context not support env.*
-    outputs:
-      tags: ${{ steps.meta.outputs.tags }}
-      labels: ${{ steps.meta.outputs.labels }}
-      image_tag: ${{ steps.meta.outputs.version }}
-      deploy_env: ${{ env.DEPLOY_ENV }}
-      deploy_url: ${{ env.DEPLOY_URL }}
-      helm_values_file: "${{ env.HELM_VALUES_FOLDER }}/${{ env.HELM_VALUES_FILE_PREFIX }}-${{ env.DEPLOY_ENV }}.yaml"
-
-  build-push:
+  trivy-sca-security-gate:
     runs-on: ubuntu-latest
     needs:
       - setup
-    permissions:
-      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Login to Container Registry
-        uses: docker/login-action@v3
+      - name: Trivy SCA Vulnerability Fail Gate
+        uses: aquasecurity/trivy-action@0.28.0
         with:
-          registry: ${{ env.IMAGE_REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ needs.setup.outputs.tags }}
-          labels: ${{ needs.setup.outputs.labels }}
-          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
-          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          scan-type: "fs"
+          scan-ref: .
+          scanners: 'vuln,license'
+          severity: 'MEDIUM,HIGH,CRITICAL'
+          format: table
+          output: ${{ env.TRIVY_SCA_OUTPUT_FILENAME }}
+          exit-code: 1
         env:
-          DOCKER_BUILD_RECORD_UPLOAD: false
+          TRIVY_DISABLE_VEX_NOTICE: true
+      - name: Publish Trivy SCA Output to Summary
+        if: always()
+        run: |
+          if [[ -s $TRIVY_SCA_OUTPUT_FILENAME ]]; then
+            {
+              echo "### Trivy SCA Output"
+              echo "<details><summary>Click to expand</summary>"
+              echo ""
+              echo '```terraform'
+              cat $TRIVY_SCA_OUTPUT_FILENAME
+              echo '```'
+              echo "</details>"
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+    env:
+      TRIVY_SCA_OUTPUT_FILENAME: trivy-sca-report.txt
 
-  # Commit to Git for ArgoCD
-  git-commit:
+  trivy-image-security-gate:
     runs-on: ubuntu-latest
     needs:
       - setup
       - build-push
     steps:
-      - name: Check if container image tag exists
-        uses: tyriis/docker-image-tag-exists@v2.1.0
-        id: check-tag
-        with:
-          registry: ${{ env.IMAGE_REGISTRY }}
-          repository: ${{ env.IMAGE_REPO }}
-          tag: ${{ needs.setup.outputs.image_tag }}
-      - name: Fail if container image tag not exists
-        if: steps.check-tag.outputs.tag == 'not found'
-        run: |
-          echo "::error title=Container image tag not found::Container image tag ${{ needs.setup.outputs.image_tag }} does not exist"
-          exit 1
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Trivy Image Vulnerability Fail Gate
+        uses: aquasecurity/trivy-action@0.28.0
         with:
-          repository: ${{ env.GITOPS_REPO }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Update Image Version in Helm Value file
-        uses: fjogeleit/yaml-update-action@main
-        with:
-          commitChange: false
-          valueFile: ${{ needs.setup.outputs.helm_values_file }}
-          changes: |
+          image-ref: ${{ env.IMAGE_NAME }}:${{ needs.setup.outputs.image_tag }}
+          scanners: 'vuln,misconfig,secret'
+          severity: 'HIGH,CRITICAL'
+          format: table
+          ignore-unfixed: true
+          output: ${{ env.TRIVY_IMAGE_OUTPUT_FILENAME }}
+          exit-code: 1
+        env:
+          TRIVY_DISABLE_VEX_NOTICE: true
+      - name: Publish Trivy Image Output to Summary
+        if: always()
+        run: |
+          if [[ -s $TRIVY_IMAGE_OUTPUT_FILENAME ]]; then
             {
-              "image.tag": "${{ needs.setup.outputs.image_tag }}",
-              "image.repository": "${{ env.IMAGE_NAME }}"
-            }
-      - name: Commit to GitOps repository
-        uses: leigholiver/commit-with-deploy-key@v1.0.4
-        with:
-          source: ${{ needs.setup.outputs.helm_values_file }}
-          destination_folder: ${{ env.HELM_VALUES_FOLDER }}
-          destination_repo: ${{ env.GITOPS_REPO }}
-          deploy_key: ${{ secrets.GITOPS_DEPLOY_KEY }}
-          commit_message: "Update Image Version to ${{ env.IMAGE_NAME}}:${{ needs.setup.outputs.image_tag }}"
+              echo "### Trivy Image Output"
+              echo "<details><summary>Click to expand</summary>"
+              echo ""
+              echo '```terraform'
+              cat $TRIVY_IMAGE_OUTPUT_FILENAME
+              echo '```'
+              echo "</details>"
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+    env:
+      TRIVY_IMAGE_OUTPUT_FILENAME: trivy-image-report.txt

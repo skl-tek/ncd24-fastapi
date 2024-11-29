@@ -55,7 +55,7 @@ async def root(request: Request):
   logging.warning("Hey, This is a warning!")
   logging.error("Oops! We have an Error")
   logging.critical("Critical error. Please fix this!")
-  return {"Hello": "World 5555555"}
+  return {"Hello": "World 5555555 0000"}
 
 @app.get("/io_task")
 async def io_task():
